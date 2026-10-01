@@ -587,6 +587,186 @@ class OcspPrecheckResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# /deployments/revocation-review: chain-wide offline OCSP/CRL evidence audit
+# ---------------------------------------------------------------------------
+
+
+class RevocationReviewEndpoint(BaseModel):
+    endpoint_id: str = Field(..., min_length=1)
+    target_leaf_fingerprint: str = Field(
+        ...,
+        min_length=64,
+        description="SHA-256 fingerprint (hex, case-insensitive) of the target "
+                    "leaf certificate in the PEM bundle.",
+    )
+
+
+class RevocationReviewRequest(BaseModel):
+    """Offline revocation evidence for every non-root certificate in chains."""
+
+    pem_certificates: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Unordered PEM bag; same parsing/deduplication rules as "
+                    "/scenarios/normalize.",
+    )
+    trust_roots: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Self-signed root fingerprints allowed to terminate a "
+                    "reconstructed chain.",
+    )
+    endpoints: list[RevocationReviewEndpoint] = Field(..., min_length=1)
+    ocsp_responses: list[str] = Field(
+        default_factory=list,
+        description="Base64-encoded DER OCSP responses (ASCII whitespace is "
+                    "ignored). Each successful response must contain exactly "
+                    "one CertID; multi-response OCSP is unsupported.",
+    )
+    crls: list[str] = Field(
+        default_factory=list,
+        description="DER/PEM CRL set. Each item may be PEM CRL or Base64 "
+                    "DER CRL. A PEM item containing more than one CRL block "
+                    "is invalid evidence.",
+    )
+    check_time: datetime = Field(
+        ...,
+        description="Evidence instant (ISO-8601; naive datetimes are UTC).",
+    )
+    max_skew_seconds: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_OCSP_SKEW_SECONDS,
+        description="Clock skew tolerance in seconds for OCSP/CRL freshness; "
+                    "at most 300.",
+    )
+
+    @field_validator("check_time")
+    @classmethod
+    def _check_time_utc(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v.astimezone(timezone.utc)
+
+
+RevocationEvidenceStatus = Literal["good", "revoked", "unknown"]
+RevocationCertReason = Literal[
+    "ok",
+    "certificate_revoked",
+    "evidence_conflict",
+    "certificate_unknown",
+    "evidence_stale",
+    "evidence_missing",
+    "evidence_invalid",
+]
+RevocationEndpointReason = Literal[
+    "ok",
+    "certificate_revoked",
+    "evidence_conflict",
+    "certificate_unknown",
+    "evidence_stale",
+    "evidence_missing",
+    "evidence_invalid",
+]
+
+
+class RevocationEvidence(BaseModel):
+    """One fresh, authentic OCSP/CRL assertion bound to a chain certificate."""
+
+    evidence_type: Literal["ocsp", "crl"]
+    source_index: int = Field(
+        ...,
+        description="Zero-based index in ocsp_responses or crls.",
+    )
+    status: RevocationEvidenceStatus
+    fresh: bool = True
+    issuer_fingerprint: str
+    signer_type: Literal["issuer", "responder_certificate"]
+    signer_fingerprint: str
+    responder_id_type: Optional[Literal["name", "key_hash"]] = None
+    produced_at: Optional[datetime] = None
+    this_update: datetime
+    next_update: datetime
+    revocation_time: Optional[datetime] = None
+    revocation_reason: Optional[str] = None
+
+
+class RevocationEvidenceIssue(BaseModel):
+    """A stable diagnostic for a submitted OCSP response or CRL."""
+
+    evidence_type: Literal["ocsp", "crl"]
+    source_index: int
+    reason: str = Field(
+        ...,
+        description="Machine-readable failure/non-binding reason, e.g. "
+                    "invalid_ocsp_response, response_stale, crl_signer_not_found, "
+                    "indirect_crl_unsupported or crl_issuer_mismatch.",
+    )
+    message: str
+    certificate_fingerprint: Optional[str] = None
+    issuer_fingerprint: Optional[str] = None
+    signer_fingerprint: Optional[str] = None
+    candidate_signer_fingerprints: Optional[list[str]] = None
+    this_update: Optional[datetime] = None
+    next_update: Optional[datetime] = None
+
+
+class RevocationCertificateResult(BaseModel):
+    certificate_fingerprint: str
+    issuer_fingerprint: str
+    subject: str
+    reason: RevocationCertReason
+    eligible: bool = Field(
+        ...,
+        description="True only when the certificate has at least one fresh, "
+                    "consistent good assertion and no fresh revoked/unknown "
+                    "assertion.",
+    )
+    evidence: list[RevocationEvidence] = Field(
+        ...,
+        description="Fresh authentic assertions for this exact certificate and "
+                    "its chain issuer, sorted by type/source.",
+    )
+    issues: list[RevocationEvidenceIssue] = Field(
+        ...,
+        description="Evidence-source issues that pertain to this certificate, "
+                    "including stale or non-binding assertions.",
+    )
+
+
+class RevocationEndpointResult(BaseModel):
+    endpoint_id: str
+    target_leaf_fingerprint: str
+    eligible: bool = Field(
+        ...,
+        description="True only when every non-root certificate on the unique "
+                    "target chain has consistent fresh good evidence.",
+    )
+    reason: RevocationEndpointReason
+    chain: list[str]
+    certificates: list[RevocationCertificateResult]
+    evidence_issues: list[RevocationEvidenceIssue] = Field(
+        ...,
+        description="Endpoint-specific evidence issues, sorted stably.",
+    )
+
+
+class RevocationReviewResult(BaseModel):
+    check_time: datetime
+    max_skew_seconds: int
+    results: list[RevocationEndpointResult] = Field(
+        ...,
+        description="Per-endpoint verdicts, sorted by endpoint_id; each chain "
+                    "is leaf-first and certificate results are in chain order.",
+    )
+    evidence_issues: list[RevocationEvidenceIssue] = Field(
+        ...,
+        description="Issues for evidence that could not be bound to a reviewed "
+                    "certificate, plus globally unsupported/malformed sources.",
+    )
+
+
+# ---------------------------------------------------------------------------
 # /plans/reconcile: infer a safe resumption point after a deployment outage
 # ---------------------------------------------------------------------------
 

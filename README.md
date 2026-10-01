@@ -11,6 +11,8 @@
 DNS/IP 身份，并沿链累计中间 CA 的名称约束（excluded 优先、permitted 取交集）。
 以及 **OCSP 装订响应离线预检**：不上网、不连响应器，直接校验端点将装订的
 OCSP 响应是否由签发者（或其授权响应证书）签名、状态为 good 且在有效期内。
+还有**链级撤销证据审查**：为目标链的叶证书和每张中间证书离线核对 OCSP/CRL，
+只有所有非信任根证书在同一时刻都有新鲜、一致的 good 证据才允许交给规划接口。
 还有**证书变体选择**：给定每个端点最多 12 条候选指纹链与异构客户端各自的
 信任根、可接受叶公钥类型和签名算法 OID，为每个端点求出**覆盖全部必连
 客户端关系的最小变体部署集合**（全局最优，非逐客户端贪心），并在无解时
@@ -288,6 +290,75 @@ curl -s http://localhost:8080/deployments/ocsp-precheck \
 可用 `examples/gen_ocsp_precheck_example.py` 重新生成（响应窗口
 2024–2035、`check_time` 固定为 2030-01-01，重新生成后多年内保持
 `eligible: true`）。
+
+### `POST /deployments/revocation-review` — 链级离线撤销证据审查
+
+在规划前一次性审查目标链上**每张非信任根证书**（叶 + 全部中间 CA；信任根本身
+不需要撤销证据）。服务仍然先按签名关系重建每条端点目标链；链不存在或交叉签名
+导致不唯一时，和归一化/身份预检一样返回 `422`（`no_trust_path` /
+`ambiguous_chain`）。链唯一后，证据本身的问题不会使整个请求失败，而会在结果中
+按端点、证书和来源索引稳定列出：
+
+```bash
+curl -s http://localhost:8080/deployments/revocation-review \
+  -H 'Content-Type: application/json' \
+  --data @examples/revocation_review_request.json
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `pem_certificates` / `trust_roots` / `endpoints[].target_leaf_fingerprint` | 与 `/deployments/precheck` 相同的 PEM 包、信任根和目标叶指纹 |
+| `ocsp_responses` | Base64 DER 离线 OCSP 响应列表（空白可忽略）；每个 successful Basic OCSP 响应必须只含一个 CertID |
+| `crls` | DER/PEM CRL 集合；每个元素可以是一个 `BEGIN X509 CRL` PEM 块，也可以是 Base64 DER CRL |
+| `check_time` | 统一证据时刻（ISO-8601；裸时间按 UTC） |
+| `max_skew_seconds` | 时钟偏差容忍秒数，最多 300，缺省 0 |
+
+**OCSP 绑定与校验**：CertID 的序列号、哈希算法、`issuerNameHash` 和
+`issuerKeyHash` 必须与“被证证书 + 链上直接签发者”精确匹配；签名者必须是该
+直接签发者，或由它直接签发、在 `check_time` 有效且带 `id-kp-OCSPSigning` 的
+授权响应证书。随后验证响应签名，要求 `successful`、`producedAt` 不晚于
+`check_time + skew`、必须有 `nextUpdate`，并且
+`thisUpdate − skew <= check_time <= nextUpdate + skew`。`good` / `revoked` /
+`unknown` 只有在这些条件都通过后才作为新鲜证据。
+
+**CRL 绑定与校验**：CRL 必须能在 PEM 包内**唯一**绑定签名证书——签名验证通过且
+CRL issuer DN 与签名者 subject DN 一致；同 DN/同密钥多证书导致不唯一时按
+`crl_signer_ambiguous` 拒绝。签名者必须是被证证书在链上的直接签发者；不存在于
+审查链、由其他 CA 签名或无法唯一绑定的 CRL 不作为 good/revoked 证据。服务验证
+CRL 签名、`thisUpdate`/`nextUpdate`（`nextUpdate` 必填，并应用同一 skew 窗口），
+序列号命中撤销条目为 `revoked`，在新鲜完整 CRL 中没有条目为 `good`。以下 CRL
+一律按不支持/无效处理：
+
+- delta CRL（含 Delta CRL Indicator）：`delta_crl_unsupported`；
+- indirect CRL（IDP `indirectCRL`）：`indirect_crl_unsupported`；
+- `onlySomeReasons` 部分原因 CRL：`partial_reason_crl_unsupported`，不能用其
+  条目缺席证明其他原因未撤销；
+- 未知关键 CRL 扩展：`unsupported_critical_crl_extension`；
+- 范围与被证证书类型不符（仅 user/仅 CA）只对该证书不绑定，原因
+  `crl_scope_mismatch`。
+
+判定规则：
+
+- 链上每张非根证书都至少有一条新鲜、密码学绑定正确的 `good` 证据，且没有新鲜
+  `revoked` / `unknown` 或冲突证据，端点才 `eligible: true`；
+- 新鲜 `revoked` 优先；即使另一来源同时给出新鲜 `good`，该证书和端点仍为
+  `certificate_revoked`（这是新鲜 good/revoked 冲突的失败关闭形式），两条证据
+  都会保留以便审计；
+- 新鲜 OCSP `unknown` 为 `certificate_unknown`；
+- 证据过期、缺 `nextUpdate`、尚未生效、签名错误、响应者未授权等不会形成有效
+  good；没有其他有效证据时分别归为 `evidence_stale` / `evidence_invalid`；
+- 完全没有绑定证据为 `evidence_missing`。
+
+返回结果按 `endpoint_id` 排序；每个端点返回唯一 `chain`、按链顺序排列的
+`certificates`、每张证书的 `evidence` 与 `evidence_issues`。证据带有
+`source_index`（对应 `ocsp_responses` 或 `crls` 下标）、状态、签发者/签名者指纹、
+签名者类型、`this_update`/`next_update` 和撤销时间/原因。无法绑定到任何审查证书
+的证据问题放在顶层 `evidence_issues`。只有 `eligible: true` 的结果可把其
+`chain` 作为 `target_chain` 交给 `/plans`。示例请求见
+[`examples/revocation_review_request.json`](examples/revocation_review_request.json)，
+可用 `examples/gen_revocation_review_example.py` 重新生成。
 
 ### `POST /deployments/variants` — 异构客户端最小证书变体选择
 

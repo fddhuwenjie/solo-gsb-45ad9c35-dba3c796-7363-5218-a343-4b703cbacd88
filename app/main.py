@@ -34,6 +34,8 @@ from .models import (
     ReconcileRequest,
     ReconcileResult,
     RelationshipRef,
+    RevocationReviewRequest,
+    RevocationReviewResult,
     VariantSelectionErrorDetail,
     VariantSelectionConflict,
     VariantSelectionRequest,
@@ -43,6 +45,7 @@ from .normalize import NormalizeError, normalize_scenario
 from .ocsp import ocsp_precheck
 from .precheck import precheck_identities
 from .reconcile import reconcile
+from .revocation import review_revocation
 from .variants import VariantSelectionError, select_variants
 
 
@@ -292,6 +295,33 @@ def ocsp_precheck_deployment(req: OcspPrecheckRequest) -> Any:
     (bad fingerprint, unknown leaf, unparseable PEM) return 422.
     """
     return ocsp_precheck(req)
+
+
+@app.post(
+    "/deployments/revocation-review",
+    response_model=RevocationReviewResult,
+    responses={422: {"model": _NormalizeErrorResponse}},
+    summary="Review chain-wide offline OCSP/CRL revocation evidence",
+)
+def revocation_review(req: RevocationReviewRequest) -> Any:
+    """Reconstruct each endpoint's unique target chain and audit offline
+    revocation evidence for every non-root certificate.
+
+    OCSP responses must carry one CertID, match the certificate and its direct
+    chain issuer, be signed by that issuer or an authorized delegated
+    responder, and be fresh at ``check_time`` (within ``max_skew_seconds``).
+    CRLs must have one in-bundle signer that is the certificate's direct chain
+    issuer, a valid signature and a fresh thisUpdate/nextUpdate window;
+    indirect, delta and reason-scoped CRLs are rejected. A CRL entry means
+    revoked and absence from a fresh complete CRL means good.
+
+    Fresh revoked assertions take precedence; conflicting good/revoked
+    evidence, unknown assertions, stale/missing/invalid evidence, and chains
+    that cannot be uniquely reconstructed all make the endpoint ineligible.
+    Malformed evidence is reported with stable per-source reasons rather than
+    preventing review of other evidence.
+    """
+    return review_revocation(req)
 
 
 @app.post(
