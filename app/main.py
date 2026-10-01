@@ -34,6 +34,8 @@ from .models import (
     ReconcileRequest,
     ReconcileResult,
     RelationshipRef,
+    RevocationReviewRequest,
+    RevocationReviewResult,
     VariantSelectionErrorDetail,
     VariantSelectionConflict,
     VariantSelectionRequest,
@@ -43,6 +45,7 @@ from .normalize import NormalizeError, normalize_scenario
 from .ocsp import ocsp_precheck
 from .precheck import precheck_identities
 from .reconcile import reconcile
+from .revocation import revocation_review
 from .variants import VariantSelectionError, select_variants
 
 
@@ -292,6 +295,43 @@ def ocsp_precheck_deployment(req: OcspPrecheckRequest) -> Any:
     (bad fingerprint, unknown leaf, unparseable PEM) return 422.
     """
     return ocsp_precheck(req)
+
+
+@app.post(
+    "/deployments/revocation-review",
+    response_model=RevocationReviewResult,
+    responses={422: {"model": _NormalizeErrorResponse}},
+    summary="Offline chain-wide OCSP/CRL revocation evidence review",
+)
+def revocation_review_deployment(req: RevocationReviewRequest) -> Any:
+    """Review offline revocation evidence for every certificate of each
+    endpoint's reconstructed target chain.
+
+    Each target leaf's unique signature-verified chain is rebuilt with the
+    same machinery as /scenarios/normalize. OCSP responses are bound by
+    CertID to a certificate and its verified on-chain issuer; each response's
+    responder (the issuer or an authorized delegate), signature and
+    thisUpdate/nextUpdate freshness are checked exactly as in
+    /deployments/ocsp-precheck. Each CRL is parsed (DER or PEM), bound to the
+    unique bundle certificate whose subject matches its issuer DN and whose
+    key verifies its signature, checked for CA/cRLSign authority and the
+    thisUpdate(lastUpdate)/nextUpdate window, and scanned for the chain
+    certificates' serials. Indirect CRLs (issuingDistributionPoint
+    indirectCRL) and delta CRLs (deltaCRLIndicator), and CRLs whose signer
+    cannot be bound uniquely, are reported as unsupported/unusable rather
+    than guessed at.
+
+    Only fresh, authentic evidence valid at the exact check_time counts: a
+    certificate is eligible only when it has good evidence and no revoked
+    evidence; fresh revoked always wins, simultaneous fresh good and revoked
+    is an unresolved conflict, and missing/stale evidence fails closed. The
+    trust anchor terminating a chain is not reviewed. Results are sorted by
+    endpoint_id, per-certificate entries are in chain order and each carries
+    its full evidence list with stable source indices; evidence that binds
+    to no reviewed certificate is returned under unattributed_evidence.
+    Eligible endpoints' ``chain`` is ready to hand to /plans.
+    """
+    return revocation_review(req)
 
 
 @app.post(
